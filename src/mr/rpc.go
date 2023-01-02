@@ -9,6 +9,14 @@ package mr
 import "os"
 import "strconv"
 
+type State int
+
+const (
+	NOTSTARTED State = 0
+	RUNNING State = 1
+	FINISHED State = 2
+)
+
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
@@ -24,6 +32,21 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type TaskArgs struct {
+	MapFin bool
+	ReduceFin bool
+	Fname string
+	PartitionNum int
+}
+
+type TaskReply struct {
+	DoMap bool
+	DoReduce bool
+	Busy bool
+	Fname string
+	PartitionNum int
+	NReduce int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

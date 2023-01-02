@@ -4,7 +4,18 @@ import "fmt"
 import "log"
 import "net/rpc"
 import "hash/fnv"
+import "os"
+import "io/ioutil"
+import "time"
+import "encoding/json"
+import "path/filepath"
+import "sort"
 
+// for sorting by key.
+type ByKey []KeyValue
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // Map functions return a slice of KeyValue.
@@ -33,36 +44,165 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	// Loop till no more tasks (all finished)
+	for {
 
+		// RPC request to coordinator to get task
+		rpcReply := CallGetTask()
+		
+		// Check if no tasks available currently and sleep if so
+		if rpcReply.Busy {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// Check if jobs all done, terminate worker if so
+		if !rpcReply.DoMap && !rpcReply.DoReduce {
+			return
+		}
+
+		// Do either Map or Reduce task depending on which assigned
+		if rpcReply.DoMap { 
+			// Map task assigned
+
+			// Read input file for Map task
+			filename := rpcReply.Fname
+			file, err := os.Open(filename)
+			if err != nil {
+				log.Fatalf("cannot open %v", filename)
+				continue
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", filename)
+				continue
+			}
+			file.Close()
+
+			// Run mapper to compute intermediate keyValue pairs
+			intermediate := mapf(filename, string(content))
+	
+			// Create intermediate partition files
+			inames := []string{}
+			ifiles := [](*json.Encoder){}
+			for i := 0; i < rpcReply.NReduce; i++ {
+				iname := fmt.Sprintf("mr-int-%v-%s", i, filepath.Base(filename))
+				inames = append(inames, iname)
+				ifile, _ := os.Create(iname)
+				ifiles = append(ifiles, json.NewEncoder(ifile))
+			}
+			
+			// Write keyValue pairs to appropriate intermediate partitions
+			for _, keyValuePair := range intermediate {
+				partitionNum := ihash(keyValuePair.Key) % rpcReply.NReduce
+				ifiles[partitionNum].Encode(&keyValuePair)
+			}
+			
+			// Notify coordinator of completion of Map task
+			CallCompleteTask(filename, -1, true, false)
+
+		} else if rpcReply.DoReduce {
+			// Reduce task assigned
+
+			// Get list of intermediate files to read according to partition number
+			partitionNum := rpcReply.PartitionNum
+			intermediateFiles, err := filepath.Glob(fmt.Sprintf("mr-int-%d-%v", partitionNum, "*"))
+			if err != nil{
+				log.Println("Glob error")
+				continue
+			}
+
+			// Read intermediate files and store key value pairs
+			kva := []KeyValue{}
+			for _, fname := range intermediateFiles {
+				file, err := os.Open(fname)
+				if err != nil {
+					log.Fatalf("cannot open %v", fname)
+					continue
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					kva = append(kva, kv)
+				}
+
+			}
+
+			// Sort key value pairs
+			sort.Sort(ByKey(kva))
+
+			// Create partition output file and call reduce on each distinct key
+			oname := fmt.Sprintf("mr-out-%d", partitionNum)
+			ofile, _ := os.Create(oname)
+			i := 0
+			for i < len(kva) {
+				j := i + 1
+				for j < len(kva) && kva[j].Key == kva[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, kva[k].Value)
+				}
+				output := reducef(kva[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+				i = j
+			}
+			ofile.Close()
+			
+			// Notify coordinator of completion of Reduce task
+			CallCompleteTask("", partitionNum, false, true)
+		}
+
+	}
 }
 
 //
-// example function to show how to make an RPC call to the coordinator.
+// RPC function to get next task for worker if any available
 //
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func CallGetTask() (reply TaskReply) {
 
 	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
+	args := TaskArgs{}
 
 	// declare a reply structure.
-	reply := ExampleReply{}
+	reply = TaskReply{}
 
 	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
+	ok := call("Coordinator.GetTask", &args, &reply)
+	if !ok {
+		fmt.Printf("call failed!\n")
+	}
+
+	return
+}
+
+//
+// RPC function to get next task for worker if any available
+//
+func CallCompleteTask(Fname string, PartitionNum int, MapFin, ReduceFin bool) {
+
+	// declare an argument structure.
+	args := TaskArgs{}
+
+	// fill in the argument(s).
+	args.Fname = Fname
+	args.PartitionNum = PartitionNum
+	args.MapFin = MapFin
+	args.ReduceFin = ReduceFin
+
+	// declare a reply structure.
+	reply := TaskReply{}
+
+	// send the RPC request, wait for the reply.
+	ok := call("Coordinator.CompleteTask", &args, &reply)
+	if !ok {
 		fmt.Printf("call failed!\n")
 	}
 }
